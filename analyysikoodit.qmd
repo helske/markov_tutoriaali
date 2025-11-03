@@ -1,0 +1,741 @@
+---
+title: "Analyysikoodit artikkeliin Markov-menetelmät elämänkulkuaineistojen tutkimuksessa"
+format: 
+  html:
+    embed-resources: true
+execute:
+  cache: true
+editor: source
+editor_options: 
+  chunk_output_type: console
+---
+
+## Pakettien ja datan lataus
+
+```{r prelim}
+#| cache: false
+#| message: false
+#| warning: false
+library(ggplot2)
+library(ggseqplot)
+library(dplyr)
+library(seqHMM)
+library(future)
+library(TraMineR)
+library(forcats)
+library(patchwork)
+plan(multisession, workers = 4) # rinnakkaislaskenta optimointiin
+```
+
+Ladataan aineisto:
+```{r data}
+d <- readRDS(file = "sla_data.rds") |> 
+  mutate(
+    id = as.factor(id),
+    aad_std = (aad - 40) / 10,
+    status = fct_recode(
+      status,
+      Töissä = "working",
+      Sairauslomalla = "sick leave",
+      Muu = "other"
+    ),
+    lääkitys = fct_recode(
+      medication,
+      "Ei lääkitystä" = "no", Lääkitys = "yes"
+    ),
+    y = interaction(status, lääkitys, sep = " / ", lex.order = TRUE)
+  ) |> select(-medication)
+```
+
+## Tavallinen Markov-malli
+
+```{r markov}
+#| warning: false
+#| message: false
+seqdata <- data_to_stslist(d, "id", "time", "y")
+fit_markov <- build_mm(observations = seqdata)
+saveRDS(fit_markov, file = "fit_markov.rds")
+round(fit_markov$initial_probs, 2)
+round(fit_markov$transition_probs, 2)
+```
+
+Apufunktio joka laskee montako prosenttia optimoinneista löysi parhaimman ratkaisun:
+```{r}
+global_mode_found <- function(fit, tolerance = 0.001) {
+  ll <- logLik(fit)
+  ll_diff <- ll - fit$estimation_results$logliks_of_restarts
+  conv <- ll_diff / abs(ll) < tolerance
+  pct <- round(100 * mean(conv))
+  n <- sum(conv)
+  print(
+    paste0(
+      length(ll_diff), " restarts: ", pct, "% (", n, 
+      ") of restarts found the same optimum (relative difference < 0.1%)."
+    )
+  )
+  n
+}
+```
+
+
+## MHMM selittäjillä, 2 piilotilaa, 2-6 klusteria
+
+
+```{r alkuarvot}
+pi <- c(0.9, 0.1)
+A <- matrix(c(0.95, 0.05, 0.05, 0.95), 2, 2)
+# ensimmäisen vuoden ja viimeisen 3v havaintojakaumat emissioiden alkuarvoiksi
+B1_status <- rbind(
+  prop.table(table(d$status[d$time < 12])), 
+  prop.table(table(d$status[d$time > 23]))
+)
+B2_status <- rbind(
+  prop.table(table(d$status[d$time < 12])), 
+  prop.table(table(d$status[d$time > 23]))
+)
+B1_lääke <- rbind(
+  c(0.1, 0.9), 
+  c(0.9, 0.1)
+)
+B2_lääke <- rbind(
+  c(0.3, 0.7), 
+  c(0.5, 0.5)
+)
+inits <- list(
+  initial_probs = rep(list(pi), 2),
+  transition_probs = rep(list(A), 2),
+  emission_probs = list(list(B1_status, B1_lääke), list(B2_status, B2_lääke))
+)
+init_eta <- estimate_mnhmm(
+  n_states = 2, n_clusters = 2,
+  emission_formula = c(status, lääkitys) ~  1,
+  transition_formula = ~ 1,
+  initial_formula = ~ 1,
+  cluster_formula = ~ history + education + aad_std + female + comorbidity,
+  data = d, time = "time", id = "id",
+  inits = inits, init_sd = 0, 
+  lambda = 0.01,
+  maxeval = -1,
+  method = "DNM", check_rank = FALSE
+)$etas
+```
+
+```{r mc_mhmm}
+comparisons <- data.frame(K = 2:6, p = 0, logL = 0, AIC = 0, BIC = 0, global = 0, time = 0)
+for (i in 1:5) {
+  set.seed(1)
+  fit <- estimate_mnhmm(
+    n_states = 2, n_clusters = i + 1,
+    emission_formula = c(status, lääkitys) ~  1,
+    transition_formula = ~ 1,
+    initial_formula = ~ 1,
+    cluster_formula = ~ history + education + aad_std + female + comorbidity,
+    data = d, time = "time", id = "id", 
+    lambda = 0.1, # regularisointikerroin
+    ftol_rel = 1e-10, ftol_abs = 1e-8,
+    restarts = 50, inits = inits, init_sd = 1,
+    method = "DNM", check_rank = FALSE, save_all_solutions = TRUE,
+    cluster_names = paste0("Klusteri ", 1:(i + 1)),
+    state_names = paste0("Tila ", 1:2)
+  )
+  saveRDS(fit, file = paste0("fit_mhmm_K", i + 1, ".rds"))
+  print(
+    paste0(
+      i + 1,
+      " klusterin malli sovitettu ajassa ", 
+      fit$estimation_results$time[3]
+    )
+  )
+  n <- global_mode_found(fit)
+  inits <- fit$etas
+  inits$eta_pi[[i + 2]] <- init_eta$eta_pi[[1]]
+  inits$eta_A[[i + 2]] <- init_eta$eta_A[[1]]
+  inits$eta_B[[i + 2]] <- init_eta$eta_B[[1]]
+  inits$eta_omega <- rbind(inits$eta_omega, 0)
+  ll <- logLik(fit)
+  aic <- AIC(fit)
+  bic <- BIC(fit)
+  elapsed_time <- fit$estimation_results$time[3]
+  comparisons[i, -1] <- c(attr(ll, "df"), ll, aic, bic, n, elapsed_time)
+  rm(fit)
+  saveRDS(comparisons, file = "mhmm_vertailu.rds")
+}
+```
+
+Vertaillaan malleja informaatiokriteerein:
+
+```{r ic}
+comparisons
+```
+
+```{r}
+comparisons |> 
+  ggplot(aes(K, BIC)) + 
+  geom_line() + 
+  geom_point() +
+  labs(y = "BIC", x = "Klusterien lukumäärä") +
+  theme_minimal()
+```
+
+Käytetään neljän klusterin ratkaisua yksinkertaisuuden vuoksi.
+
+```{r load_model}
+fit <- readRDS("fit_mhmm_K4.rds")
+```
+
+Estimoidut alkutila-, siirtymä- ja emissiotodennäköisyydet:
+```{r}
+pi <- get_initial_probs(fit) |> filter(id == 1)
+A <- get_transition_probs(fit) |> filter(time == 1 & id == 1)
+B <- get_emission_probs(fit)
+
+B_status <- B$status |>
+  filter(time == 1 & id == 1) |>
+  select(cluster, state, status, probability)
+B_lääkitys <- B$lääkitys |>
+  filter(time == 1 & id == 1) |>
+  select(cluster, state, lääkitys, probability)
+B_joint <- inner_join(
+  B_status,
+  B_lääkitys,
+  by = c("cluster", "state"), suffix = c("_s", "_l"), 
+  relationship = "many-to-many"
+) |>
+  mutate(
+    y = interaction(status, lääkitys, sep = " / ", lex.order = TRUE),
+    probability = probability_l * probability_s,
+    .by = c(cluster, state, status, lääkitys)
+  ) |>
+  select(cluster, state, y, probability)
+
+z_n <- levels(B_joint$state)
+y_n <- levels(B_joint$y)
+yc <- fit$symbol_names
+klusterit <- setNames(vector("list", 4), cluster_names(fit))
+
+for (i in names(klusterit)) {
+  klusterit[[i]] <- list(
+    pi = pi |> filter(cluster == i) |> 
+      pull(probability) |> 
+      setNames(z_n),
+    A = A |> filter(cluster == i) |> 
+      pull(probability) |> 
+      matrix(nrow = 2, ncol = 2, byrow = TRUE, dimnames = list(z_n, z_n)),
+    B = B_joint |> filter(cluster == i) |> 
+      pull(probability) |> 
+      matrix(nrow = 2, ncol = 6, byrow = TRUE, dimnames = list(z_n, y_n)),
+    B_status = B_status |> filter(cluster == i) |> 
+      pull(probability) |> 
+      matrix(2, 3, byrow = TRUE, dimnames = list(z_n, yc$status)),
+    B_lääkitys = B_lääkitys |> filter(cluster == i) |> 
+      pull(probability) |> 
+      matrix(2, 2, byrow = TRUE, dimnames = list(z_n, yc$lääkitys))
+  )
+}
+lapply(klusterit, \(x) round(x$B_status, 2))
+lapply(klusterit, \(x) round(x$B_lääkitys, 2))
+lapply(klusterit, \(x) round(x$pi, 2))
+lapply(klusterit, \(x) round(x$A, 2))
+```
+
+Nimetään piilotilat ja määritellään värejä piirtämistä varten. Käytetään viisiluokkaista etuliite-asteikkoa `""` (>90%, tyhjä), `"lähinnä"` (60%-90%), `"osin"` (33-66%), `"harvoin"` (10-33%), `"ei"` (<10%) työstatukselle sekä lääkitykselle. 
+
+```{r}
+states <- list(
+  c("Töissä, lähinnä lääkityksellä", "Töissä, ei lääkitystä"),
+  c("Lähinnä töissä, osin lääkitys", "Muu, osin lääkitys"),
+  c("Lähinnä töissä, harvoin lääkitystä", "Muu, harvoin lääkitystä"),
+  c("Lähinnä sairauslomalla, osin lääkitys", "Töissä, osin lääkitys")
+)
+state_levels <- c(
+  "Töissä, ei lääkitystä",
+  "Töissä, osin lääkitys",
+  "Töissä, lähinnä lääkityksellä",
+  "Lähinnä töissä, harvoin lääkitystä",
+  "Lähinnä töissä, osin lääkitys",
+  "Lähinnä sairauslomalla, osin lääkitys", # = 85% S, 13% M, edellä T<->S
+  "Muu, harvoin lääkitystä",
+  "Muu, osin lääkitys"
+)
+
+state_labels <- c(
+  "Töissä,\nei lääkitystä", 
+  "Töissä,\nosin lääkitys",
+  "Töissä,\nlähinnä lääkityksellä", 
+  "Lähinnä töissä,\nharvoin lääkitystä", 
+  "Lähinnä töissä,\nosin lääkitys", 
+  "Lähinnä sairauslomalla,\nosin lääkitys", # = 85% S, 13% M, edellä T<->S
+  "Muu,\nharvoin lääkitystä", 
+  "Muu,\nosin lääkitys"
+)
+state_names(fit) <- states
+cols <- setNames(
+  RColorBrewer::brewer.pal(6, "Paired")[c(4, 3, 6, 5, 2, 1)],
+  levels(d$y)
+)
+
+work <- c("#33A02CFF", "#33A02CCC", "#33A02C99", "#33A02C66", "#33A02C33")
+sick <- c("#E31A1CFF", "#E31A1CCC", "#E31A1C99", "#E31A1C66", "#E31A1C33")
+other <- c("#1F78B4FF", "#1F78B4CC", "#1F78B499", "#1F78B466", "#1F78B433")
+#colorRampPalette(c("#33A02C", "#E31A1C"))(5) # työ <-> sairausloma
+wsh <- c("#33A02CCC", "#5F7E28CC", "#8B5D24CC", "#B63B20CC", "#E31A1CCC") #, harvoin lääkitys
+wso <- c("#33A02C99", "#5F7E2899", "#8B5D2499", "#B63B2099", "#E31A1C99") #, osin lääkitys
+#colorRampPalette(c("#1F78B4", "#E31A1C"))(5) # muu <-> sairausloma 
+# "#1F78B4" "#50608E" "#814968" "#B23141" "#E31A1C"
+oso <- c("#1F78B499", "#50608E99", "#81496899", "#B2314199", "#E31A1C99") #, osin lääkitys
+state_cols <- setNames(
+  c(work[c(1, 3, 4)], wsh[2], wso[2], oso[4], other[c(2, 3)]),
+  state_levels
+)
+```
+
+Lasketaan todennäköisimpien piilotilojen polut ja luodaan sekvenssidata joka on järjestetty moniulotteisella skaalauksella käyttäen optimal matching -algoritmia piilotilapolkujen etäisyysmatriisin laskentaan:
+
+```{r}
+#| message: false
+hp <- hidden_paths(fit)
+d <- d |> 
+  left_join(hp, by = c("time", "id")) |> 
+  mutate(state = factor(state, levels = state_levels))
+
+seqdata <- lapply(
+  cluster_names(fit),
+  \(x) {
+    # muunna stslist-muotoon
+    seqs <- d |> 
+      filter(cluster == x) |> 
+      droplevels()
+    ycols <- cols[levels(seqs$y)]
+    scols <- state_cols[levels(seqs$state)]
+    seqs <- seqs|> 
+      data_to_stslist(
+        id = "id", time = "time", responses = c("y", "state"),
+        seqdef_args = list(y = list(cpal = ycols), state = list(cpal = scols))
+      )
+    # laske etäisyydet piilotilojen perusteella
+    distances <- suppressWarnings(suppressMessages(
+      TraMineR::seqdist(
+        seqs$state, method = "OM", sm = "CONSTANT"
+      )
+    ))
+    # järjestä
+    ordering <- order(drop(stats::cmdscale(distances, k = 1)))
+    lapply(seqs, \(x) x[ordering, ])
+  }
+)
+```
+
+Poimitaan jokaisen klusterin järjestetyistä piilotiloista 500 sekvenssiä tasaisin välein ja piirretään nämä:
+```{r}
+plots <- vector("list", 4)
+for(i in 1:4) {
+  idx <- seq(1, nrow(seqdata[[i]]$state), length = 500)
+  plots[[i]] <- ggseqiplot(seqdata[[i]]$state[idx, ])
+}
+```
+
+```{r}
+#| warning: false
+wrap_plots(plots, 2, 2, axes = "collect") &
+  scale_colour_manual(values = rep(NA, 8), na.value = NA, guide = "none") &
+  guides(fill = guide_legend(nrow = 2)) &
+  theme(legend.position = "bottom")
+```
+
+Nimetään nyt klusterit ja piirretään uudestaan klustereiden koon mukaisessa järjestyksessä:
+```{r cluster_names}
+cl_names <- c(
+  "Työelämässä pysyvät lääkityksen lopettajat (28%)",
+  "Työelämästä poistuvat toistuvasti oireilevat (22%)",
+  "Työelämästä poistuvat lääkityksen lopettajat (29%)",
+  "Työelämässä pysyvät toistuvasti oireilevat (21%)"
+)
+cluster_names(fit) <- names(klusterit) <- names(seqdata) <- cl_names
+mpc <- most_probable_cluster(fit)
+t(rbind(
+  n = table(mpc), osuus = round(100 * prop.table(table(mpc)))
+))
+saveRDS(seqdata, file = "mhmm_K4_seqdata.rds")
+saveRDS(klusterit, file = "mhmm_K4_probs.rds")
+```
+
+```{r plot_states}
+#| warning: false
+#| message: false
+cl_ord <- c(3, 1, 2, 4) # klustereiden suuruusjärjestys
+plots <- vector("list", 4)
+for(i in 1:4) {
+  idx <- seq(1, nrow(seqdata[[i]]$state), length = 500)
+  plots[[i]] <- ggseqiplot(seqdata[[i]]$state[idx, ]) + ggtitle(names(seqdata)[i])
+}
+
+p <- wrap_plots(plots[cl_ord], 2, 2, axes = "collect") &
+  scale_colour_manual(values = rep(NA, 8), na.value = NA, guide = "none") &
+  scale_fill_manual(
+    values = unname(state_cols), breaks = state_levels, labels = state_labels
+  ) &
+  guides(fill = guide_legend(nrow = 1)) &
+  scale_x_discrete(
+    "Kuukausia diagnoosista",
+    breaks = seq(1, 60, 12), labels = seq(0, 59, 12)
+  ) &
+  coord_cartesian(
+    xlim = c(0, 60), expand = FALSE
+  ) &
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.x = element_text(size = text_size),
+    legend.text = element_text(size = text_size),
+    axis.text = element_text(size = text_size),
+    plot.title = element_text(size = text_size),
+    axis.line = element_blank(),
+    legend.position = "bottom",
+    plot.margin = margin(10, 5, 0, 5),
+    legend.box.spacing = unit(1, "mm")
+  )
+p
+```
+
+Havaintojen kuukausittaiset osuudet klustereittain:
+```{r plot_obs}
+#| warning: false
+#| message: false
+seq_y <- d |> data_to_stslist("id", "time", "y", seqdef_args = list(cpal = cols))
+plots <- vector("list", 4)
+for(i in 1:4) {
+  plots[[i]] <- ggseqdplot(seq_y[mpc == cl_names[i], ]) + ggtitle(cl_names[i])
+}
+p <- wrap_plots(plots[cl_ord], 2, 2, axes = "collect", guides = "collect") &
+  guides(fill = guide_legend(nrow = 2)) &
+  scale_x_discrete(
+    "Kuukausia diagnoosista",
+    breaks = seq(1, 60, 12), labels = seq(0, 59, 12)
+  ) &
+  scale_y_continuous("Osuus havainnoista", breaks = seq(0, 1, by = 0.2), expand = FALSE) &
+  coord_cartesian(
+    xlim = c(0, 60), ylim = 0:1, expand = FALSE
+  ) &
+  theme(
+    axis.title = element_text(size = text_size),
+    legend.text = element_text(size = text_size),
+    axis.text = element_text(size = text_size),
+    plot.title = element_text(size = text_size),
+    axis.line = element_blank(),
+    legend.position = "bottom",
+    plot.margin = margin(10, 5, 0, 5),
+    legend.box.spacing = unit(2, "mm")
+  )
+p
+```
+
+Klustereiden sekoitusmatriisi (klusterien erottelevuus):
+```{r confusion}
+confusion_matrix <- function(object) {
+  pcp <- posterior_cluster_probabilities(object)
+  mpc <- pcp |> summarise(mpc = cluster[which.max(probability)], .by = id) |> 
+    pull(mpc)
+  clProbs <- matrix(NA, nrow = object$n_clusters, ncol = object$n_clusters)
+  cluster_names <- object$cluster_names
+  rownames(clProbs) <- colnames(clProbs) <- cluster_names
+  for (i in object$cluster_names) {
+    for (j in object$cluster_names) {
+      clProbs[j, i] <- mean(pcp[cluster == i][mpc == j, probability])
+    }
+  }
+  clProbs
+}
+
+round(confusion_matrix(fit), 2)[c(3, 1, 2, 4), c(3, 1, 2, 4)]
+```
+
+Klustereiden posterioritodennäköisyydet:
+
+```{r}
+pcp <- posterior_cluster_probabilities(fit)
+pcp |> summarise(
+  p = max(probability), cluster = cluster_names(fit)[which.max(probability)], .by = id
+) |> 
+  summarise(
+    q2.5 = quantile(p, 0.025),
+    mean = mean(p),
+    q97.5 = quantile(p, 0.975),
+    under_50 = mean(p < 0.5),
+    over_90 = mean(p > 0.9),
+    over_95 = mean(p > 0.95),
+    over_99 = mean(p > 0.99),
+    .by = cluster
+  ) |> 
+  arrange(cluster)
+```
+
+Bootstrap luottamusvälien laskentaan:
+```{r bootstrapping}
+#| warning: false
+#| message: false
+fit <- bootstrap_coefs(fit, nsim = 1000, relax_tolerances = TRUE)
+saveRDS(fit, file = "fit_mhmm_K4.rds")
+```
+
+Regressiokertoimien estimaatit ja luottamusvälit:
+```{r coefs}
+coef_estimates <- coef(fit, probs = c(0.025, 0.975))
+print(coef_estimates$cluster)
+saveRDS(coef_estimates, file = "kertoimet_mhmm_K4.rds")
+```
+
+Klustereihin kuulumisen prioritodennäköisyydet selittävien muuttujien perusteella:
+
+```{r efektit}
+# lasketaan bootstrap-replikaateille todennäköisyydet käsin
+X <- fit$X_omega
+omega <- fit$boot$gamma_omega
+n <- ncol(X)
+pr <- array(NA, c(4, n, length(omega)))
+for (i in seq_along(omega)) {
+  pr[, , i] <- apply(omega[[i]] %*% X, 2, seqHMM:::softmax)
+}
+prp <- data.frame(
+  cluster = cluster_names(fit),
+  id = factor(rep(seq_len(n), each = 4)),
+  probability = c(pr),
+  replication = rep(seq_along(omega), each = 4 * n)
+)
+prp <- prp |> 
+  left_join(
+    d |> 
+      filter(time == 0) |> 
+      select(id, female, education, history, comorbidity, aad),
+    by = "id"
+  )
+priori_efektit <- list(
+  female = prp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(female, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(female, cluster)
+    ),
+  education = prp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(education, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(education, cluster)
+    ),
+  history = prp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(history, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(history, cluster)
+    ),
+  comorbidity = prp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(comorbidity, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(comorbidity, cluster)
+    ),
+  aad = prp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(aad, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(aad, cluster)
+    )
+)
+saveRDS(priori_efektit, file = "priori_efektitt_mhmm_K4.rds")
+```
+
+Sama posterioritodennäköisyyksille:
+
+```{r post_efektit}
+# kuten get_cluster_probs, myös posterior_cluster_probabilities-funktiosta 
+# puuttuu luottamusvälien automaattinen laskenta
+n <- fit$n_sequences
+nsim <- length(fit$boot[[1]])
+fit_boot <- fit
+pr <- vector("list", nsim)
+for (i in seq_len(nsim)) {
+  fit_boot$gammas$gamma_pi <- fit$boot$gamma_pi[[i]]
+  fitb$gammas$gamma_A <- fit$boot$gamma_A[[i]]
+  fit_boot$gammas$gamma_B <- fit$boot$gamma_B[[i]]
+  fit_boot$gammas$gamma_omega <- fit$boot$gamma_omega[[i]]
+  pr[[i]] <- posterior_cluster_probabilities(fit_boot)
+  print(i)
+}
+pcp <- bind_rows(pr, .id = "replication") |>  
+  left_join(
+    d |> 
+      filter(time == 0) |> 
+      select(id, female, education, history, comorbidity, aad),
+    by = "id"
+  )
+
+post_efektit <- list(
+  female = pcp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(female, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(female, cluster)
+    ),
+  education = pcp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(education, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(education, cluster)
+    ),
+  history = pcp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(history, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(history, cluster)
+    ),
+  comorbidity = pcp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(comorbidity, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(comorbidity, cluster)
+    ),
+  aad = pcp |> 
+    summarise(
+      prob = mean(probability),
+      .by = c(aad, cluster, replication)
+    ) |> 
+    summarise(
+      probability = mean(prob),
+      q5 = quantile(prob, 0.05),
+      q95 = quantile(prob, 0.95), 
+      .by = c(aad, cluster)
+    )
+)
+saveRDS(post_efektit, file = "post_efektit_mhmm_K4.rds")
+```
+
+```{r plot_coefs1}
+#| warning: false
+#| message: false
+cl_names <- levels(priori_efektit$female$cluster)[c(2, 1, 3, 4)]
+
+p <- bind_rows(
+  Posterioritodennäköisyys = post_efektit$female, 
+  Prioritodennäköisyys = prior_efektit$female, 
+  .id = "Tyyppi"
+) |> 
+  mutate(
+    sukupuoli = case_match(female, "no" ~ "Mies", "yes" ~ "Nainen"),
+    cluster = factor(cluster, levels = cl_names),
+    Tyyppi = factor(
+      Tyyppi, 
+      levels = c("Prioritodennäköisyys", "Posterioritodennäköisyys")
+      )
+  ) |> 
+  ggplot(aes(probability, cluster)) +
+  geom_linerange(aes(xmin = q5, xmax = q95, colour = Tyyppi),
+                 position = position_dodge(0.2)) +
+  geom_point(aes(colour = Tyyppi), position = position_dodge(0.2)) + 
+  facet_wrap(~ sukupuoli) + 
+  scale_y_discrete(limits = rev, labels = scales::label_wrap(20)) +
+  scale_x_continuous(
+    breaks = seq(0.15, 0.4, by = 0.05), minor_breaks = NULL
+  ) +
+  labs(x = "Klusteriin kuulumisen todennäköisyys", y = NULL) +
+  scale_colour_grey(start = 0.7, end = 0.2) +
+  theme_minimal(base_size = text_size) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = text_size),
+    strip.text = element_text(size = text_size),
+    axis.text = element_text(size = text_size),
+    axis.title.x = element_text(size = text_size),
+    panel.spacing = unit(2, "lines")
+  )
+p
+```
+
+```{r plot_coefs2}
+#| warning: false
+#| message: false
+p <- bind_rows(
+  Posterioritodennäköisyys = post_efektit$aad, 
+  Prioritodennäköisyys = prior_efektit$aad, 
+  .id = "Tyyppi"
+) |> 
+  mutate(
+    cluster = factor(cluster, levels = cl_names),
+    Tyyppi = factor(
+      Tyyppi, 
+      levels = c("Prioritodennäköisyys", "Posterioritodennäköisyys")
+    )
+  ) |> 
+  ggplot(aes(aad, probability)) +
+  geom_ribbon(aes(ymin = q5, ymax = q95, fill = Tyyppi), alpha = 0.5) +
+  geom_line(aes(colour = Tyyppi)) + 
+  scale_x_continuous(
+    breaks = seq(30, 50, by = 5), minor_breaks = NULL
+  ) +
+  scale_y_continuous(
+    breaks = seq(0.15, 0.4, by = 0.05),
+    minor_breaks = NULL, limits = c(0.12, 0.38), expand = FALSE
+  ) +
+  labs(
+    x = "Ikä vuosina diagnosointihetkellä",
+    y = "Klusteriin kuulumisen todennäköisyys"
+  ) +
+  facet_wrap(~ cluster, 2, 2) +
+  theme_minimal(base_size = text_size) +
+  scale_colour_grey(start = 0.7, end = 0.2) +
+  scale_fill_grey(start = 0.8, end = 0.4) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = text_size),
+    strip.text = element_text(size = text_size),
+    axis.text = element_text(size = text_size),
+    axis.title = element_text(size = text_size)
+  )
+p
+```
