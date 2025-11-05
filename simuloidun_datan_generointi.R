@@ -1,9 +1,62 @@
-library(dplyr)
-library(TraMineR)
 library(ggseqplot)
+library(dplyr)
+library(seqHMM)
+library(TraMineR)
+library(forcats)
+
+d <- readRDS(file = "sla_data.rds") |> 
+  mutate(
+    id = as.factor(id),
+    aad_std = (aad - 40) / 10,
+    status = fct_recode(
+      status,
+      Töissä = "working",
+      Sairauslomalla = "sick leave",
+      Muu = "other"
+    ),
+    lääkitys = fct_recode(
+      medication,
+      "Ei lääkitystä" = "no", Lääkitys = "yes"
+    ),
+    y = interaction(status, lääkitys, sep = " / ", lex.order = TRUE)
+  ) |> select(-medication) |> 
+  filter(time == 0)
+
+fit <- readRDS("fit_mhmm_K4.rds")
+mpc <- most_probable_cluster(fit)
+d$cluster <- mpc
+
+# kovariaattien klusterikohtaiset (marginaali)jakaumat:
+
+(p_history <- prop.table(table(d$cluster, d$history), margin = 1))
+(p_comorbidity <- prop.table(table(d$cluster, d$comorbidity), margin = 1))
+(p_female <- prop.table(table(d$cluster, d$female), margin = 1))
+(p_education <- prop.table(table(d$cluster, d$education), margin = 1))
+(p_aad_std <- prop.table(table(d$cluster, d$aad_std), margin = 1))
+
+history <- factor(colnames(p_history), levels = levels(d$history))
+comorbidity <- 0:1
+female <- factor(colnames(p_female), levels = levels(d$female))
+education <- factor(colnames(p_education), levels = levels(d$education))
+
+set.seed(1)
+dx <- bind_rows(
+  lapply(1:4, \(i) {
+    data.frame(
+      id = (i - 1) * 500 +  1:500, 
+      history = sample(history, size = 500, replace = TRUE, prob = p_history[i, ]),
+      comorbidity = sample(comorbidity, size = 500, replace = TRUE, prob = p_comorbidity[i, ]),
+      female = sample(female, size = 500, replace = TRUE, prob = p_female[i, ]),
+      education = sample(education, size = 500, replace = TRUE, prob = p_education[i, ]),
+      aad_std = sample(seq(-1,1, by = 0.1), size = 500, replace = TRUE, prob = p_aad_std[i, ])
+    )
+  }
+  ),
+  .id = "cluster"
+)
 
 # alkuperäinen aineisto ositettu mallinnuksen perusteella neljään osaan (klusteriin)
-seqdata_mhmm_K4 <- readRDS("seqdata_mhmm_K4.rds")
+seqdata_mhmm_K4 <- readRDS("W:/JouniH/sla/seqdata_mhmm_K4.rds")
 
 # lasketaan jokaisesta klusterista keskimääräiset kuukausittaiset 
 # siirtymätodennäköisyydet havaintokategorioiden välillä
@@ -26,15 +79,27 @@ simuloi_sekvenssi <- function(malli) {
   y
 }
 
-# nimet ja värit
+# nimet
 obs <- alphabet(seqdata_mhmm_K4[[1]]$y)
-cols <- cpal(seqdata_mhmm_K4[[1]]$y)
 # simuloi 4x500 sekvenssiä
-set.seed(1)
-simuloidut_sekvenssit <- lapply(markov_mallit, \(x) {
-  y <- replicate(500, simuloi_sekvenssi(x))
-  seqdef(t(y), states = obs, cpal = cols)
-})
-
+dy <- bind_rows(
+  lapply(1:4, \(i) {
+    y <- replicate(500, simuloi_sekvenssi(markov_mallit[[i]]))
+    data.frame(
+      time = rep(0:59, each = 500),
+      id = (i - 1) * 500 +  1:500, 
+      y = c(t(y))
+    )
+  }), 
+  .id = "cluster"
+)
+dy <- dy |> mutate(y = obs[y]) |> 
+  tidyr::separate_wider_delim(y, " / ", names = c("status", "lääkitys")) |> 
+  mutate(
+    status = factor(status, levels = c("Töissä", "Sairauslomalla", "Muu")),
+    lääkitys = factor(lääkitys, levels = c("Ei lääkitystä", "Lääkitys"))
+  )
+# yhdistetään simuloidut kovariaatit ja sekvenssit
+dsim <- left_join(dy, dx, by = c("id", "cluster"))
 # tallennetaan simuloitu aineisto
-saveRDS(simuloidut_sekvenssit, file = "simuloidut_sekvenssit.rds")
+saveRDS(dsim, file = "simuloidut_sekvenssit.rds")
