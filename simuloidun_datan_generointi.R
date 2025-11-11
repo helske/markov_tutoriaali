@@ -56,7 +56,7 @@ dx <- bind_rows(
 )
 
 # alkuperäinen aineisto ositettu mallinnuksen perusteella neljään osaan (klusteriin)
-seqdata_mhmm_K4 <- readRDS("W:/JouniH/sla/seqdata_mhmm_K4.rds")
+seqdata_mhmm_K4 <- readRDS("seqdata_mhmm_K4.rds")
 
 # lasketaan jokaisesta klusterista keskimääräiset kuukausittaiset 
 # siirtymätodennäköisyydet havaintokategorioiden välillä
